@@ -1,0 +1,84 @@
+# marketing_knn_nb.R ---------------------------------------------------------
+# Predict term-deposit subscription with k-NN and Naïve Bayes
+# Author: Divya Gunjan   Date: 2024-08
+
+# ---- 0.  Setup ----
+library(tidyverse)
+library(class)         # knn()
+library(caret)         # createFolds()
+library(data.table)    # one_hot()
+library(mltools)
+library(e1071)         # naiveBayes()
+library(here)
+library(glue)
+
+# ---- 1.  Load and clean data ----
+BANK_PATH <- here("data", "bank-full.csv")
+bank <- read.csv(BANK_PATH, sep = ";", na.strings = "unknown")
+
+# flag missing for three categorical cols (MVI)
+for (col in c("job", "education", "poutcome")) {
+  mvi <- paste0("MVI_", col)
+  bank[[mvi]] <- ifelse(is.na(bank[[col]]), 1, 0)
+  bank[[col]][is.na(bank[[col]])] <- "unknown"
+}
+
+# drop column found insignificant in χ² tests
+bank$contact <- NULL
+
+# one-hot encode categoricals
+cat_cols <- c("job", "marital", "default", "housing", "loan",
+              "poutcome", "education", "month")
+bank_dt  <- as.data.table(bank)
+bank_enc <- one_hot(bank_dt, cols = cat_cols)
+
+# ---- 2.  Train-test split ----
+set.seed(1)
+bank_enc <- bank_enc[sample(.N)]          # shuffle rows
+split_idx <- floor(0.8 * nrow(bank_enc))
+train <- bank_enc[1:split_idx, ]
+test  <- bank_enc[(split_idx + 1):.N, ]
+train_y <- train$y;  test_y <- test$y
+train[, y := NULL];  test[, y := NULL]
+
+# ---- 3.  Helper: min-max scaling ----
+scale_minmax <- function(train_df, test_df) {
+  mins <- sapply(train_df, min)
+  maxs <- sapply(train_df, max)
+  f <- function(x, mn, mx) (x - mn) / (mx - mn)
+  train_sc <- as.data.frame(mapply(f, train_df, mins, maxs))
+  test_sc  <- as.data.frame(mapply(f, test_df, mins, maxs))
+  list(train = train_sc, test = test_sc)
+}
+
+# ---- 4.  k-NN with 5-fold CV ----
+folds <- createFolds(train_y, k = 5)
+knn_cv_acc <- function(k) {
+  errs <- sapply(folds, function(idx) {
+    ss <- scale_minmax(train[-idx, ], train[idx, ])
+    pred <- knn(ss$train, ss$test, cl = train_y[-idx], k = k)
+    mean(pred != train_y[idx])
+  })
+  1 - mean(errs)
+}
+
+k_grid   <- c(1, 5, 10, 20, 50, 100, ceiling(sqrt(nrow(train))))
+cv_scores <- sapply(k_grid, knn_cv_acc)
+best_k    <- k_grid[which.max(cv_scores)]
+message("Best k = ", best_k)
+
+# final k-NN fit
+ss <- scale_minmax(train, test)
+knn_pred <- knn(ss$train, ss$test, cl = train_y, k = best_k)
+knn_acc  <- mean(knn_pred == test_y)
+
+# ---- 5.  Naïve Bayes baseline ----
+nb_model <- naiveBayes(train, train_y)
+nb_pred  <- predict(nb_model, test)
+nb_acc   <- mean(nb_pred == test_y)
+
+cat(glue(
+  "Results\n-------\n",
+  "k-NN  (k={best_k}): {round(knn_acc,3)}\n",
+  "Naïve Bayes      : {round(nb_acc ,3)}\n"
+))
